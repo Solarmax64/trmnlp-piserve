@@ -4,6 +4,8 @@ A shell-based manager for [TRMNL](https://trmnl.com) plugin development on Raspb
 
 Built for Raspberry Pi OS Bookworm. Should work on any Debian-based ARM64 or x86_64 system.
 
+This was built for personal use and was completely created using vibe coding, and extensive testing and revisions iterations using ChatGPT and Claude Code (http://claude.com/product/claude-code). 
+
 ## What it does
 
 - Interactive TUI menu (whiptail/dialog) with plain-text fallback
