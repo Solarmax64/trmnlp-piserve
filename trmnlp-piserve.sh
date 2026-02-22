@@ -22,7 +22,7 @@
 #   1. Run: ./trmnlp-piserve.sh
 #   2. The script will check for Ruby 3.4+ and offer to install it if missing
 #   3. Use menu option 1 to init a new plugin, or 2 to clone an existing one
-#   4. Use menu option 3 to serve your plugin locally for preview
+#   4. Use menu option 3 to serve your plugin locally for preview (Ctrl+C to stop)
 #   5. Use menu option N to install Firefox Nightly (needed for PNG rendering)
 #
 # Configuration:
@@ -59,9 +59,6 @@ BASE_DIR="/home/pi/syncthing/trmnl-plugins"
 STATE_DIR="${HOME}/.config/trmnlp-piserve"
 SECRETS_FILE="${STATE_DIR}/secrets.env"
 SETTINGS_FILE="${STATE_DIR}/settings.env"
-PID_DIR="${STATE_DIR}/pids"
-LOG_DIR="${STATE_DIR}/logs"
-PROXY_PID_DIR="${STATE_DIR}/proxy-pids"
 FF_PROFILE_DIR="${STATE_DIR}/ff-profile"
 
 # ENGINE controls how trmnlp is executed:
@@ -95,7 +92,7 @@ TRMNL_PREVIEW_FIREFOX_DEFAULT="${TRMNL_PREVIEW_FIREFOX_DEFAULT:-/usr/local/bin/f
 # If neither is available, it falls back to plain text menus. Set TRMNLP_TUI=0 to force plain text.
 DIALOG_CMD=""
 
-mkdir -p "${STATE_DIR}" "${PID_DIR}" "${LOG_DIR}" "${PROXY_PID_DIR}" "${FF_PROFILE_DIR}"
+mkdir -p "${STATE_DIR}" "${FF_PROFILE_DIR}"
 
 # -- Output helpers --
 # bold/note/warn/err/die: Consistent, color-coded output for user feedback
@@ -323,7 +320,6 @@ kill_existing_socat_on_port(){
     warn "Killing stale proxy on ${BIND_PORT}: $pids"
     if [[ "${PRINT_ONLY}" == "1" ]]; then echo '$ kill '"$pids"; else kill $pids 2>/dev/null || true; sleep 0.2; fi
   fi
-  rm -f "${PROXY_PID_DIR}"/*.proxy.pid 2>/dev/null || true
 }
 start_proxy_fg(){
   PROXY_PID_OUT=""; [[ "${ENABLE_PROXY}" == "1" ]] || return 0
@@ -336,20 +332,6 @@ start_proxy_fg(){
   note "Proxy http://${ip}:${BIND_PORT} → 127.0.0.1:${BIND_PORT} (pid ${PROXY_PID_OUT})"
 }
 stop_proxy_fg(){ local pid="$1"; [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true; }
-start_proxy_daemon(){
-  [[ "${ENABLE_PROXY}" == "1" ]] || return 0
-  ensure_proxy_dep; kill_existing_socat_on_port
-  local plugin="$1" ip; ip="$(lan_ip)"; [[ -z "$ip" ]] && { warn "No LAN IP; skipping proxy."; return 0; }
-  local pidf="${PROXY_PID_DIR}/${plugin}.proxy.pid"
-  if [[ -f "$pidf" ]] && ps -p "$(cat "$pidf")" >/dev/null 2>&1; then return 0; fi
-  if [[ "${PRINT_ONLY}" == "1" ]]; then
-    echo '$ '"${SOCAT_BIN}" "TCP-LISTEN:${BIND_PORT},bind=${ip},reuseaddr,fork" "TCP:127.0.0.1:${BIND_PORT}"
-    return 0
-  fi
-  "${SOCAT_BIN}" "TCP-LISTEN:${BIND_PORT},bind=${ip},reuseaddr,fork" "TCP:127.0.0.1:${BIND_PORT}" & echo $! > "$pidf"
-  note "Proxy http://${ip}:${BIND_PORT} → 127.0.0.1:${BIND_PORT} (pid $(cat "$pidf"))"
-}
-stop_proxy_daemon(){ local plugin="$1"; local pidf="${PROXY_PID_DIR}/${plugin}.proxy.pid"; [[ -f "$pidf" ]] || return 0; kill "$(cat "$pidf")" 2>/dev/null || true; rm -f "$pidf"; }
 
 # ------------ Bundler / repo ------------
 # When ENGINE=repo, the script runs trmnlp directly from a local git checkout
@@ -464,9 +446,7 @@ png_env_vars(){
 #   init_plugin       — scaffold a new plugin directory (menu 1)
 #   clone_plugin      — download an existing plugin from TRMNL by ID (menu 2)
 #   serve_foreground  — start the preview server in the current terminal (menu 3)
-#   serve_daemon      — start the preview server as a background process (menu 4)
-#   stop_daemon       — stop a background server and its proxy (menu 5)
-#   push_plugin       — upload your plugin changes to TRMNL (menu 6)
+#   push_plugin       — upload your plugin changes to TRMNL (menu 4)
 init_plugin(){
   read -r -p "New plugin folder name: " name; name="$(trim "$name")"; [[ -n "$name" ]] || { warn "Canceled."; return; }
   local dest="${BASE_DIR}/${name}"; [[ -e "$dest" ]] && { warn "Exists: $dest"; return; }
@@ -632,155 +612,6 @@ serve_foreground(){
   fi
 
   [[ -n "${PROXY_PID}" ]] && stop_proxy_fg "${PROXY_PID}"
-}
-
-serve_daemon(){
-  local plugin="${1:-}"; [[ -z "$plugin" ]] && plugin="$(pick_plugin)"; plugin="$(trim "$plugin")"
-  [[ -n "$plugin" ]] || { warn "No plugin selected."; return; }
-  [[ -d "${BASE_DIR}/${plugin}" ]] || die "Not found: ${BASE_DIR}/${plugin}"
-  if [[ "${ENGINE}" == "repo" ]]; then repo_pull_and_bundle; fi
-
-  local pidf="${PID_DIR}/${plugin}.pid" logf="${LOG_DIR}/${plugin}.log"
-  if [[ -f "$pidf" ]] && ps -p "$(cat "$pidf")" >/dev/null 2>&1; then warn "Already running (PID $(cat "$pidf"))."; return; fi
-  start_proxy_daemon "${plugin}"
-
-  local FF_BIN; FF_BIN="$(find_firefox_nightly || true)"
-  if [[ -z "$FF_BIN" ]]; then
-    echo ""
-    err "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    err "  Firefox Nightly NOT FOUND!"
-    err "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    warn "  PNG export (/render/full.png) WILL FAIL with runtime errors."
-    warn "  HTML preview (/render/full.html) will still work."
-    warn ""
-    warn "  To enable PNG rendering, install Firefox Nightly + ImageMagick:"
-    warn "    • Run menu option 'N' from this script (installs all deps), OR"
-    warn "    • Manually install and set TRMNL_PREVIEW_FIREFOX=/path/to/firefox"
-    warn "    • Also ensure ImageMagick is installed: sudo apt install imagemagick"
-    err "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-  elif [[ ! -x "$FF_BIN" ]]; then
-    warn "Firefox Nightly path exists but is not executable: $FF_BIN"
-    warn "PNG export (/render/full.png) will NOT work."
-    FF_BIN=""
-  fi
-
-  set_xvfb_cmd
-
-  if [[ -n "$FF_BIN" ]]; then
-    ensure_geckodriver || true
-    ensure_firefox_symlink
-  fi
-
-  note "Engine: ${ENGINE}  $( [[ "${ENGINE}" == "repo" ]] && echo "(HEAD $(repo_commit_short) on $(repo_branch))" )"
-  note "Nightly: ${FF_BIN:-<not found>} (used for PNG export)"
-  note "Geckodriver: $(geckodriver --version 2>/dev/null | head -1 || echo '<not found>')"
-  [[ ${#XVFB_CMD[@]} -gt 0 ]] && note "xvfb: active (no DISPLAY detected)"
-  note "Logs: ${logf}"
-
-  local png_envs; png_envs="$(png_env_vars "$FF_BIN")"
-  local GD_BIN; GD_BIN="$(find_geckodriver || true)"
-  local se_gd_env=""
-  [[ -n "$GD_BIN" ]] && se_gd_env="SE_GECKODRIVER=${GD_BIN}"
-
-  if [[ "${PRINT_ONLY}" == "1" ]]; then
-    if [[ "${ENGINE}" == "repo" ]]; then
-      if [[ -n "$FF_BIN" ]]; then
-        echo '$ nohup sh -lc '"$(printf "%q " "cd" "${BASE_DIR}/${plugin}" "&&" \
-          "PATH=/usr/local/bin:\$PATH" \
-          ${se_gd_env:+"${se_gd_env}"} \
-          "TRMNL_PREVIEW_FIREFOX=${FF_BIN}" \
-          "MOZ_HEADLESS=1" "LIBGL_ALWAYS_SOFTWARE=1" "MOZ_DISABLE_GFX_SANITY_TEST=1" \
-          "MOZ_HEADLESS_WIDTH=800" "MOZ_HEADLESS_HEIGHT=480" \
-          "MOZ_NO_REMOTE=1" "MOZ_PROFILE_PATH=${FF_PROFILE_DIR}" \
-          "BUNDLE_GEMFILE=${REPO_DIR}/Gemfile" "PORT=${BIND_PORT}" \
-          "bundle" "_2.6.2_" "exec" "ruby" "-I" "${REPO_DIR}/lib" "${REPO_DIR}/bin/trmnlp" "serve")"' >> '"${logf}"' 2>&1 & echo $! > '"${pidf}"'
-      else
-        echo '$ nohup sh -lc '"$(printf "%q " "cd" "${BASE_DIR}/${plugin}" "&&" \
-          "PATH=/usr/local/bin:\$PATH" \
-          ${se_gd_env:+"${se_gd_env}"} \
-          "DISABLE_PNG_RENDERING=1" \
-          "MOZ_HEADLESS=1" "LIBGL_ALWAYS_SOFTWARE=1" "MOZ_DISABLE_GFX_SANITY_TEST=1" \
-          "BUNDLE_GEMFILE=${REPO_DIR}/Gemfile" "PORT=${BIND_PORT}" \
-          "bundle" "_2.6.2_" "exec" "ruby" "-I" "${REPO_DIR}/lib" "${REPO_DIR}/bin/trmnlp" "serve")"' >> '"${logf}"' 2>&1 & echo $! > '"${pidf}"'
-      fi
-    else
-      if [[ -n "$FF_BIN" ]]; then
-        echo '$ nohup sh -lc '"$(printf "%q " "cd" "${BASE_DIR}/${plugin}" "&&" \
-          "PATH=/usr/local/bin:\$PATH" \
-          ${se_gd_env:+"${se_gd_env}"} \
-          "TRMNL_PREVIEW_FIREFOX=${FF_BIN}" \
-          "MOZ_HEADLESS=1" "LIBGL_ALWAYS_SOFTWARE=1" "MOZ_DISABLE_GFX_SANITY_TEST=1" \
-          "MOZ_HEADLESS_WIDTH=800" "MOZ_HEADLESS_HEIGHT=480" \
-          "MOZ_NO_REMOTE=1" "MOZ_PROFILE_PATH=${FF_PROFILE_DIR}" \
-          "PORT=${BIND_PORT}" "trmnlp" "serve")"' >> '"${logf}"' 2>&1 & echo $! > '"${pidf}"'
-      else
-        echo '$ nohup sh -lc '"$(printf "%q " "cd" "${BASE_DIR}/${plugin}" "&&" \
-          "PATH=/usr/local/bin:\$PATH" \
-          ${se_gd_env:+"${se_gd_env}"} \
-          "DISABLE_PNG_RENDERING=1" \
-          "MOZ_HEADLESS=1" "LIBGL_ALWAYS_SOFTWARE=1" "MOZ_DISABLE_GFX_SANITY_TEST=1" \
-          "PORT=${BIND_PORT}" "trmnlp" "serve")"' >> '"${logf}"' 2>&1 & echo $! > '"${pidf}"'
-      fi
-    fi
-  else
-    local xvfb_sh=""
-    if [[ ${#XVFB_CMD[@]} -gt 0 ]]; then xvfb_sh="xvfb-run --auto-servernum --server-args='-screen 0 1280x720x24' "; fi
-    local se_gd_sh=""
-    [[ -n "$GD_BIN" ]] && se_gd_sh="SE_GECKODRIVER='${GD_BIN}' "
-
-    if [[ "${ENGINE}" == "repo" ]]; then
-      if [[ -n "$FF_BIN" ]]; then
-        nohup sh -lc "cd ${BASE_DIR}/${plugin} && \
-          PATH='/usr/local/bin:\$PATH' \
-          ${se_gd_sh}\
-          TRMNL_PREVIEW_FIREFOX='${FF_BIN}' \
-          MOZ_HEADLESS=1 LIBGL_ALWAYS_SOFTWARE=1 MOZ_DISABLE_GFX_SANITY_TEST=1 \
-          MOZ_HEADLESS_WIDTH=800 MOZ_HEADLESS_HEIGHT=480 \
-          MOZ_NO_REMOTE=1 MOZ_PROFILE_PATH='${FF_PROFILE_DIR}' \
-          BUNDLE_GEMFILE='${REPO_DIR}/Gemfile' PORT='${BIND_PORT}' \
-          ${xvfb_sh}bundle _2.6.2_ exec ruby -I '${REPO_DIR}/lib' '${REPO_DIR}/bin/trmnlp' serve" >> "${logf}" 2>&1 &
-      else
-        nohup sh -lc "cd ${BASE_DIR}/${plugin} && \
-          PATH='/usr/local/bin:\$PATH' \
-          ${se_gd_sh}\
-          DISABLE_PNG_RENDERING=1 \
-          MOZ_HEADLESS=1 LIBGL_ALWAYS_SOFTWARE=1 MOZ_DISABLE_GFX_SANITY_TEST=1 \
-          BUNDLE_GEMFILE='${REPO_DIR}/Gemfile' PORT='${BIND_PORT}' \
-          bundle _2.6.2_ exec ruby -I '${REPO_DIR}/lib' '${REPO_DIR}/bin/trmnlp' serve" >> "${logf}" 2>&1 &
-      fi
-    else
-      if [[ -n "$FF_BIN" ]]; then
-        nohup sh -lc "cd ${BASE_DIR}/${plugin} && \
-          PATH='/usr/local/bin:\$PATH' \
-          ${se_gd_sh}\
-          TRMNL_PREVIEW_FIREFOX='${FF_BIN}' \
-          MOZ_HEADLESS=1 LIBGL_ALWAYS_SOFTWARE=1 MOZ_DISABLE_GFX_SANITY_TEST=1 \
-          MOZ_HEADLESS_WIDTH=800 MOZ_HEADLESS_HEIGHT=480 \
-          MOZ_NO_REMOTE=1 MOZ_PROFILE_PATH='${FF_PROFILE_DIR}' \
-          PORT='${BIND_PORT}' ${xvfb_sh}trmnlp serve" >> "${logf}" 2>&1 &
-      else
-        nohup sh -lc "cd ${BASE_DIR}/${plugin} && \
-          PATH='/usr/local/bin:\$PATH' \
-          ${se_gd_sh}\
-          DISABLE_PNG_RENDERING=1 \
-          MOZ_HEADLESS=1 LIBGL_ALWAYS_SOFTWARE=1 MOZ_DISABLE_GFX_SANITY_TEST=1 \
-          PORT='${BIND_PORT}' trmnlp serve" >> "${logf}" 2>&1 &
-      fi
-    fi
-    echo $! > "${pidf}"; sleep 1; note "PID $(cat "${pidf}")"
-  fi
-}
-
-stop_daemon(){
-  local plugin="${1:-}"; [[ -z "$plugin" ]] && plugin="$(pick_plugin)"; plugin="$(trim "$plugin")"
-  [[ -n "$plugin" ]] || { warn "No plugin selected."; return; }
-  local pidf="${PID_DIR}/${plugin}.pid"
-  if [[ -f "$pidf" ]]; then
-    local pid; pid="$(cat "$pidf")"
-    if [[ "${PRINT_ONLY}" == "1" ]]; then echo '$ kill '"$pid"' && rm -f '"${pidf}"; else kill "$pid" 2>/dev/null || true; rm -f "$pidf"; note "Stopped app PID ${pid}"; fi
-  else warn "No PID file for ${plugin}."; fi
-  stop_proxy_daemon "${plugin}"
 }
 
 push_plugin(){
@@ -1183,9 +1014,7 @@ main_menu_dialog(){
       "1" "Init new plugin" \
       "2" "Clone plugin" \
       "3" "Serve plugin (foreground)" \
-      "4" "Serve plugin (background)" \
-      "5" "Stop background server" \
-      "6" "Push plugin" \
+      "4" "Push plugin" \
       "──" "── Plugins ────────────────────────" \
       "L" "List plugins" \
       "A" "Login" \
@@ -1210,9 +1039,7 @@ main_menu_dialog(){
       1) init_plugin ;;
       2) clone_plugin ;;
       3) serve_foreground ;;
-      4) serve_daemon ;;
-      5) stop_daemon ;;
-      6) push_plugin ;;
+      4) push_plugin ;;
       L|l) local plugins; plugins="$(get_plugins)"
          if [[ -n "$plugins" ]]; then
            local count; count="$(echo "$plugins" | wc -l)"
@@ -1257,9 +1084,7 @@ main_menu_text(){
     echo "  1) Init new plugin"
     echo "  2) Clone plugin"
     echo "  3) Serve plugin (foreground)"
-    echo "  4) Serve plugin (background)"
-    echo "  5) Stop background server + proxy"
-    echo "  6) Push plugin"
+    echo "  4) Push plugin"
     echo "Plugins:"
     echo "  L) List plugins"
     echo "  A) Login"
@@ -1280,9 +1105,7 @@ main_menu_text(){
       1) init_plugin ;;
       2) clone_plugin ;;
       3) serve_foreground ;;
-      4) serve_daemon ;;
-      5) stop_daemon ;;
-      6) push_plugin ;;
+      4) push_plugin ;;
       L|l) local plugins; plugins="$(get_plugins)"
          if [[ -n "$plugins" ]]; then
            local count; count="$(echo "$plugins" | wc -l)"
@@ -1319,7 +1142,7 @@ Usage:
   ./trmnlp-piserve.sh --help    Show this help
 
 Menu keys:
-  1-6                   Plugin workflow (init, clone, serve, stop, push)
+  1-4                   Plugin workflow (init, clone, serve, push)
   L = List plugins      A = Login
   E = Switch engine     I = Engine info
   H = Update repo       U = Rebuild gem

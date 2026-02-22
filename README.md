@@ -9,7 +9,7 @@ This was built for personal use and was completely created using vibe coding, an
 ## What it does
 
 - Interactive TUI menu (whiptail/dialog) with plain-text fallback
-- Plugin init, clone, serve (foreground or background daemon), push
+- Plugin init, clone, serve (foreground), push
 - Two execution engines: installed `trmnlp` gem or local git repo checkout
 - Ruby 3.4+ installation via rbenv (if needed)
 - Firefox Nightly install (APT with tarball fallback) for headless PNG rendering
@@ -66,9 +66,7 @@ I develop on Windows and use [Syncthing](https://syncthing.net/) to sync the plu
 | 1 | Init new plugin |
 | 2 | Clone plugin from TRMNL (by plugin_setting_id) |
 | 3 | Serve plugin in foreground (Ctrl+C to stop) |
-| 4 | Serve plugin as background daemon |
-| 5 | Stop background server and proxy |
-| 6 | Push plugin to TRMNL |
+| 4 | Push plugin to TRMNL |
 
 **Plugins**
 
@@ -177,9 +175,6 @@ Disable it with `ENABLE_PROXY=0` or through the settings menu.
 |------|---------|
 | `~/.config/trmnlp-piserve/settings.env` | Persisted settings |
 | `~/.config/trmnlp-piserve/secrets.env` | API keys (mode 600) |
-| `~/.config/trmnlp-piserve/pids/` | PID files for background daemons |
-| `~/.config/trmnlp-piserve/logs/` | Log files for background daemons |
-| `~/.config/trmnlp-piserve/proxy-pids/` | PID files for socat proxies |
 | `~/.config/trmnlp-piserve/ff-profile/` | Firefox profile for headless rendering |
 
 ## Troubleshooting
