@@ -357,9 +357,10 @@ needs_xvfb(){
   [[ -z "${DISPLAY:-}" ]] && [[ -z "${WAYLAND_DISPLAY:-}" ]]
 }
 
-xvfb_prefix(){
+set_xvfb_cmd(){
+  XVFB_CMD=()
   if needs_xvfb && command -v xvfb-run >/dev/null 2>&1; then
-    echo "xvfb-run --auto-servernum --server-args=-screen 0 1280x720x24"
+    XVFB_CMD=(xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24")
   fi
 }
 
@@ -489,7 +490,7 @@ serve_foreground(){
     FF_BIN=""
   fi
 
-  local xvfb_cmd; xvfb_cmd="$(xvfb_prefix)"
+  set_xvfb_cmd
 
   if [[ -n "$FF_BIN" ]]; then
     ensure_geckodriver || true
@@ -499,7 +500,7 @@ serve_foreground(){
   note "Engine: ${ENGINE}  $( [[ "${ENGINE}" == "repo" ]] && echo "(HEAD $(repo_commit_short) on $(repo_branch))" )"
   note "Nightly: ${FF_BIN:-<not found>} (used for PNG export)"
   note "Geckodriver: $(geckodriver --version 2>/dev/null | head -1 || echo '<not found>')"
-  [[ -n "$xvfb_cmd" ]] && note "xvfb: active (no DISPLAY detected)"
+  [[ ${#XVFB_CMD[@]} -gt 0 ]] && note "xvfb: active (no DISPLAY detected)"
   [[ "${ENABLE_PROXY}" == "1" ]] && note "Open from LAN: http://$(lan_ip):${BIND_PORT}" || note "Open locally : http://127.0.0.1:${BIND_PORT}"
   note "Serving '${plugin}' (Ctrl+C to stop)..."
 
@@ -509,7 +510,7 @@ serve_foreground(){
 
   if [[ "${ENGINE}" == "repo" ]]; then
     if [[ -n "$FF_BIN" ]]; then
-      ( cd "${BASE_DIR}/${plugin}" && run ${xvfb_cmd} env \
+      ( cd "${BASE_DIR}/${plugin}" && run "${XVFB_CMD[@]}" env \
         PATH="/usr/local/bin:$PATH" \
         ${se_gd_env} \
         TRMNL_PREVIEW_FIREFOX="${FF_BIN}" \
@@ -517,31 +518,31 @@ serve_foreground(){
         MOZ_HEADLESS_WIDTH=800 MOZ_HEADLESS_HEIGHT=480 \
         MOZ_NO_REMOTE=1 MOZ_PROFILE_PATH="${FF_PROFILE_DIR}" \
         BUNDLE_GEMFILE="${REPO_DIR}/Gemfile" PORT="${BIND_PORT}" \
-        bundle _2.6.2_ exec ruby -I "${REPO_DIR}/lib" "${REPO_DIR}/bin/trmnlp" serve )
+        bundle _2.6.2_ exec ruby -I "${REPO_DIR}/lib" "${REPO_DIR}/bin/trmnlp" serve ) || true
     else
-      ( cd "${BASE_DIR}/${plugin}" && run ${xvfb_cmd} env \
+      ( cd "${BASE_DIR}/${plugin}" && run "${XVFB_CMD[@]}" env \
         PATH="/usr/local/bin:$PATH" \
         ${se_gd_env} \
         MOZ_HEADLESS=1 LIBGL_ALWAYS_SOFTWARE=1 MOZ_DISABLE_GFX_SANITY_TEST=1 \
         BUNDLE_GEMFILE="${REPO_DIR}/Gemfile" PORT="${BIND_PORT}" \
-        bundle _2.6.2_ exec ruby -I "${REPO_DIR}/lib" "${REPO_DIR}/bin/trmnlp" serve )
+        bundle _2.6.2_ exec ruby -I "${REPO_DIR}/lib" "${REPO_DIR}/bin/trmnlp" serve ) || true
     fi
   else
     if [[ -n "$FF_BIN" ]]; then
-      ( cd "${BASE_DIR}/${plugin}" && run ${xvfb_cmd} env \
+      ( cd "${BASE_DIR}/${plugin}" && run "${XVFB_CMD[@]}" env \
         PATH="/usr/local/bin:$PATH" \
         ${se_gd_env} \
         TRMNL_PREVIEW_FIREFOX="${FF_BIN}" \
         MOZ_HEADLESS=1 LIBGL_ALWAYS_SOFTWARE=1 MOZ_DISABLE_GFX_SANITY_TEST=1 \
         MOZ_HEADLESS_WIDTH=800 MOZ_HEADLESS_HEIGHT=480 \
         MOZ_NO_REMOTE=1 MOZ_PROFILE_PATH="${FF_PROFILE_DIR}" \
-        PORT="${BIND_PORT}" trmnlp serve )
+        PORT="${BIND_PORT}" trmnlp serve ) || true
     else
-      ( cd "${BASE_DIR}/${plugin}" && run ${xvfb_cmd} env \
+      ( cd "${BASE_DIR}/${plugin}" && run "${XVFB_CMD[@]}" env \
         PATH="/usr/local/bin:$PATH" \
         ${se_gd_env} \
         MOZ_HEADLESS=1 LIBGL_ALWAYS_SOFTWARE=1 MOZ_DISABLE_GFX_SANITY_TEST=1 \
-        PORT="${BIND_PORT}" trmnlp serve )
+        PORT="${BIND_PORT}" trmnlp serve ) || true
     fi
   fi
 
@@ -578,7 +579,7 @@ serve_daemon(){
     FF_BIN=""
   fi
 
-  local xvfb_cmd; xvfb_cmd="$(xvfb_prefix)"
+  set_xvfb_cmd
 
   if [[ -n "$FF_BIN" ]]; then
     ensure_geckodriver || true
@@ -588,7 +589,7 @@ serve_daemon(){
   note "Engine: ${ENGINE}  $( [[ "${ENGINE}" == "repo" ]] && echo "(HEAD $(repo_commit_short) on $(repo_branch))" )"
   note "Nightly: ${FF_BIN:-<not found>} (used for PNG export)"
   note "Geckodriver: $(geckodriver --version 2>/dev/null | head -1 || echo '<not found>')"
-  [[ -n "$xvfb_cmd" ]] && note "xvfb: active (no DISPLAY detected)"
+  [[ ${#XVFB_CMD[@]} -gt 0 ]] && note "xvfb: active (no DISPLAY detected)"
   note "Logs: ${logf}"
 
   local png_envs; png_envs="$(png_env_vars "$FF_BIN")"
@@ -638,7 +639,7 @@ serve_daemon(){
     fi
   else
     local xvfb_sh=""
-    if [[ -n "$xvfb_cmd" ]]; then xvfb_sh="xvfb-run --auto-servernum --server-args='-screen 0 1280x720x24' "; fi
+    if [[ ${#XVFB_CMD[@]} -gt 0 ]]; then xvfb_sh="xvfb-run --auto-servernum --server-args='-screen 0 1280x720x24' "; fi
     local se_gd_sh=""
     [[ -n "$GD_BIN" ]] && se_gd_sh="SE_GECKODRIVER='${GD_BIN}' "
 
@@ -941,9 +942,9 @@ test_png_renderer(){
   fi
   "$bin" --version || true
 
-  local xvfb_cmd; xvfb_cmd="$(xvfb_prefix)"
+  set_xvfb_cmd
 
-  if ${xvfb_cmd} env \
+  if "${XVFB_CMD[@]}" env \
     MOZ_HEADLESS=1 LIBGL_ALWAYS_SOFTWARE=1 MOZ_DISABLE_GFX_SANITY_TEST=1 \
     MOZ_HEADLESS_WIDTH=800 MOZ_HEADLESS_HEIGHT=480 \
     MOZ_NO_REMOTE=1 MOZ_PROFILE_PATH="${FF_PROFILE_DIR}" \
