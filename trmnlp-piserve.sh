@@ -1,18 +1,60 @@
 #!/usr/bin/env bash
+#
+# TRMNLP-PiServe — Interactive manager for TRMNL plugin development on Raspberry Pi
+#
+# This script provides a menu-driven interface for developing, previewing, and
+# deploying TRMNL e-ink display plugins from a Raspberry Pi (or any Linux machine).
+#
+# What it does:
+#   - Manages the full plugin lifecycle: init, clone, serve, push
+#   - Runs a local preview server (trmnlp) so you can see your plugin's HTML/PNG output
+#   - Optionally exposes the server to your LAN via a socat proxy
+#   - Handles Ruby 3.4+ installation (via rbenv) if needed
+#   - Installs Firefox Nightly + geckodriver for PNG screenshot rendering
+#   - Supports two execution engines: installed gem or local git repo checkout
+#
+# Prerequisites:
+#   - A Raspberry Pi (or Linux box) with bash, curl, and sudo access
+#   - Internet access for installing dependencies
+#   - A TRMNL account and API key (for clone/push operations)
+#
+# Quick start:
+#   1. Run: ./trmnlp-piserve.sh
+#   2. The script will check for Ruby 3.4+ and offer to install it if missing
+#   3. Use menu option 1 to init a new plugin, or 2 to clone an existing one
+#   4. Use menu option 3 to serve your plugin locally for preview
+#   5. Use menu option N to install Firefox Nightly (needed for PNG rendering)
+#
+# Configuration:
+#   All settings and secrets are stored in ~/.config/trmnlp-piserve/
+#   Use menu option S to change settings, or set environment variables (see --help).
+#
+# For more details, run: ./trmnlp-piserve.sh --help
+#
 set -Eeuo pipefail
 
-# keep terminal sane
+# keep terminal sane — save and restore tty settings so the terminal isn't left
+# in a broken state if the script exits unexpectedly (e.g., Ctrl+C during a dialog)
 ORIG_STTY="$(stty -g 2>/dev/null || true)"
 restore_tty(){ command -v stty >/dev/null 2>&1 && [[ -n "${ORIG_STTY:-}" ]] && stty "$ORIG_STTY" || true; }
 trap restore_tty EXIT HUP INT TERM
 
-# ---- guard: don't run whole script as root ----
+# ---- Guard: don't run as root ----
+# Running as root can cause file permission issues with rbenv, gem installs,
+# and plugin directories. Use your normal user account (e.g., "pi") instead.
 if [[ $EUID -eq 0 ]]; then
   echo "[✗] Do not run this script as root. Run as your user (e.g., pi)."
   exit 1
 fi
 
 # ------------ Config (defaults) ------------
+# These paths and settings can be overridden via environment variables or the
+# Settings menu (option S). Persistent settings are saved to ~/.config/trmnlp-piserve/settings.env.
+#
+# Key directories:
+#   BASE_DIR     — where your plugin folders live (each subfolder is one plugin)
+#   STATE_DIR    — internal state: settings, secrets, PIDs, logs
+#   SECRETS_FILE — stores your TRMNL API key (chmod 600)
 BASE_DIR="/home/pi/syncthing/trmnl-plugins"
 STATE_DIR="${HOME}/.config/trmnlp-piserve"
 SECRETS_FILE="${STATE_DIR}/secrets.env"
@@ -22,6 +64,9 @@ LOG_DIR="${STATE_DIR}/logs"
 PROXY_PID_DIR="${STATE_DIR}/proxy-pids"
 FF_PROFILE_DIR="${STATE_DIR}/ff-profile"
 
+# ENGINE controls how trmnlp is executed:
+#   "gem"  — uses the globally installed trmnl_preview gem (simpler, recommended)
+#   "repo" — runs directly from a local git clone of the trmnlp repo (for development)
 ENGINE="${ENGINE:-gem}"             # gem|repo
 REPO_DIR="${REPO_DIR:-$HOME/trmnlp}"
 
@@ -30,10 +75,14 @@ PRINT_ONLY="${PRINT_ONLY:-0}"
 
 BIND_PORT="${BIND_PORT:-4567}"
 
+# When ENABLE_PROXY=1, a socat process forwards traffic from your LAN IP to
+# localhost, so you can access the preview server from other devices on your network.
 ENABLE_PROXY="${ENABLE_PROXY:-1}"
 SOCAT_BIN="${SOCAT_BIN:-/usr/bin/socat}"
 
 # Firefox Nightly settings
+# Firefox Nightly is required for PNG rendering (headless screenshots of your plugin).
+# HTML preview works without it, but PNG export (/render/full.png) needs Firefox + geckodriver.
 FFN_DIR="${FFN_DIR:-/opt/firefox-nightly}"               # for tarball fallback
 FFN_BIN_LINK="${FFN_BIN_LINK:-/usr/local/bin/firefox-nightly}"
 FFN_LANG="${FFN_LANG:-en-US}"
@@ -42,30 +91,39 @@ FFN_URL="${FFN_URL:-}"                                   # optional custom URL o
 # Default if we must guess; we'll auto-detect dynamically too
 TRMNL_PREVIEW_FIREFOX_DEFAULT="${TRMNL_PREVIEW_FIREFOX_DEFAULT:-/usr/local/bin/firefox-nightly}"
 
-# Dialog command (whiptail preferred, dialog fallback)
+# Dialog command — the script uses whiptail (or dialog) for a nice TUI menu.
+# If neither is available, it falls back to plain text menus. Set TRMNLP_TUI=0 to force plain text.
 DIALOG_CMD=""
 
 mkdir -p "${STATE_DIR}" "${PID_DIR}" "${LOG_DIR}" "${PROXY_PID_DIR}" "${FF_PROFILE_DIR}"
 
+# -- Output helpers --
+# bold/note/warn/err/die: Consistent, color-coded output for user feedback
 bold(){ printf "\033[1m%s\033[0m\n" "$*"; }
 note(){ printf "[*] %s\n" "$*"; }
 warn(){ printf "\033[33m[!] %s\033[0m\n" "$*"; }
 err(){  printf "\033[31m[✗] %s\033[0m\n" "$*" >&2; }
 die(){  err "$*"; exit 1; }
+# trim: strip leading/trailing whitespace and carriage returns from input
 trim(){ local s="$*"; s="${s//$'\r'/}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+# trunc: truncate a string to max length, appending ".." if it overflows
 trunc(){ local max="${1:-40}" s="${2:-}"; if (( ${#s} > max )); then printf '%s..' "${s:0:$((max-2))}"; else printf '%s' "$s"; fi; }
 ts(){ date +%Y%m%d-%H%M%S; }
 term_cols(){ tput cols 2>/dev/null || echo 80; }
 term_rows(){ tput lines 2>/dev/null || echo 24; }
+# dlg_w/dlg_h: compute dialog dimensions that fit the current terminal size
 dlg_w(){ local want="${1:-70}" tc; tc="$(term_cols)"; (( tc - 4 < want )) && want=$((tc - 4)); (( want < 40 )) && want=40; echo "$want"; }
 dlg_h(){ local want="${1:-22}" tr; tr="$(term_rows)"; (( tr - 2 < want )) && want=$((tr - 2)); (( want < 12 )) && want=12; echo "$want"; }
 
+# run: execute a command, or in dry-run mode (PRINT_ONLY=1) just print it
 run(){ if [[ "${PRINT_ONLY}" == "1" ]]; then printf '$ '; printf "%q " "$@"; echo; else "$@"; fi; }
 
 ensure_base_dir(){ [[ -d "${BASE_DIR}" ]] || { note "Creating ${BASE_DIR}"; mkdir -p "${BASE_DIR}"; }; }
 ensure_secrets(){ mkdir -p "${STATE_DIR}"; [[ -f "${SECRETS_FILE}" ]] || { umask 077; : > "${SECRETS_FILE}"; }; source "${SECRETS_FILE}" 2>/dev/null || true; }
 
 # ------------ Settings persistence ------------
+# Settings are saved to ~/.config/trmnlp-piserve/settings.env as shell-safe
+# key=value pairs. They're loaded on startup so your choices persist across runs.
 save_settings(){
   ( umask 077; cat > "${SETTINGS_FILE}" <<EOF
 BASE_DIR=$(printf '%q' "$BASE_DIR")
@@ -168,6 +226,8 @@ dialog_infobox(){
 }
 
 # ------------ Ruby helpers ------------
+# trmnlp requires Ruby >= 3.4. These helpers check the installed version
+# and offer to install Ruby 3.4 via rbenv if it's missing or too old.
 ruby_version(){ ruby -e 'print RUBY_VERSION' 2>/dev/null || echo "0.0.0"; }
 ruby_ver_ok(){ ruby -e 'v=ARGV[0].split(".").map(&:to_i); puts (v[0]>3 || (v[0]==3 && v[1]>=4)) ? "ok" : "no"' "$(ruby_version)" 2>/dev/null | grep -q ok; }
 rbenv_active(){ command -v rbenv >/dev/null 2>&1 && [[ $(command -v ruby) == *"/.rbenv/shims/ruby" ]]; }
@@ -244,6 +304,9 @@ apt_install(){
 }
 
 # ------------ LAN / proxy helpers ------------
+# The proxy uses socat to forward traffic from the Pi's LAN IP to localhost,
+# allowing you to preview plugins from your phone, laptop, or TRMNL device.
+# Example: http://192.168.1.42:4567 → http://127.0.0.1:4567
 lan_ip(){ hostname -I 2>/dev/null | awk '{print $1}'; }
 
 ensure_proxy_dep(){
@@ -289,6 +352,9 @@ start_proxy_daemon(){
 stop_proxy_daemon(){ local plugin="$1"; local pidf="${PROXY_PID_DIR}/${plugin}.proxy.pid"; [[ -f "$pidf" ]] || return 0; kill "$(cat "$pidf")" 2>/dev/null || true; rm -f "$pidf"; }
 
 # ------------ Bundler / repo ------------
+# When ENGINE=repo, the script runs trmnlp directly from a local git checkout
+# of the trmnlp repository. These helpers manage cloning, pulling, and bundling.
+# When ENGINE=gem, the globally installed trmnl_preview gem is used instead.
 ensure_bundler_lock_version(){ run gem install --no-document bundler -v 2.6.2 || true; }
 ensure_repo_checkout(){ [[ -d "${REPO_DIR}/.git" ]] || { note "Cloning repo to ${REPO_DIR}"; run git clone https://github.com/usetrmnl/trmnlp.git "${REPO_DIR}"; }; }
 repo_pull_and_bundle(){ ensure_repo_checkout; ensure_bundler_lock_version; if [[ "${PRINT_ONLY}" == "1" ]]; then echo '$ (cd '"${REPO_DIR}"' && git pull --ff-only && bundle _2.6.2_ install)'; else (cd "${REPO_DIR}" && run git pull --ff-only && bundle _2.6.2_ install); fi; }
@@ -310,6 +376,8 @@ install_gem_from_head(){
 }
 
 # ------------ Plugin picker ------------
+# Scans BASE_DIR for plugin subdirectories and presents a selection menu.
+# Backup directories (*.bak-*) are hidden by default (toggle via SHOW_BACKUPS).
 get_plugins(){ shopt -s nullglob; local e name; for e in "$BASE_DIR"/*; do [[ -d "$e" ]] || continue; name="${e##*/}"; [[ "${SHOW_BACKUPS}" == "0" && "$name" == *.bak-* ]] && continue; printf '%s\n' "$name"; done | sort; shopt -u nullglob; }
 
 pick_plugin(){
@@ -334,6 +402,10 @@ pick_plugin(){
 }
 
 # ------------ trmnlp command wrapper ------------
+# Abstracts running trmnlp commands so the rest of the script doesn't need to
+# care whether ENGINE=gem or ENGINE=repo. In repo mode, it sets up the bundle
+# environment and runs from the local checkout. In gem mode, it calls the
+# globally installed trmnlp binary.
 run_trmnlp(){
   if [[ "${ENGINE}" == "repo" ]]; then
     ensure_repo_checkout
@@ -353,6 +425,8 @@ run_trmnlp(){
 }
 
 # ------------ xvfb helper for PNG rendering ------------
+# On headless systems (no DISPLAY or WAYLAND_DISPLAY), xvfb-run provides a
+# virtual framebuffer so Firefox can render pages for PNG screenshots.
 needs_xvfb(){
   [[ -z "${DISPLAY:-}" ]] && [[ -z "${WAYLAND_DISPLAY:-}" ]]
 }
@@ -383,6 +457,16 @@ png_env_vars(){
 }
 
 # ------------ Actions ------------
+# These are the core operations available from the menu. Each function corresponds
+# to a menu option and handles user interaction, validation, and execution.
+#
+# Plugin workflow:
+#   init_plugin       — scaffold a new plugin directory (menu 1)
+#   clone_plugin      — download an existing plugin from TRMNL by ID (menu 2)
+#   serve_foreground  — start the preview server in the current terminal (menu 3)
+#   serve_daemon      — start the preview server as a background process (menu 4)
+#   stop_daemon       — stop a background server and its proxy (menu 5)
+#   push_plugin       — upload your plugin changes to TRMNL (menu 6)
 init_plugin(){
   read -r -p "New plugin folder name: " name; name="$(trim "$name")"; [[ -n "$name" ]] || { warn "Canceled."; return; }
   local dest="${BASE_DIR}/${name}"; [[ -e "$dest" ]] && { warn "Exists: $dest"; return; }
@@ -477,9 +561,10 @@ serve_foreground(){
     warn "  PNG export (/render/full.png) WILL FAIL with runtime errors."
     warn "  HTML preview (/render/full.html) will still work."
     warn ""
-    warn "  To enable PNG rendering, install Firefox Nightly:"
-    warn "    • Run menu option 'N' from this script, OR"
+    warn "  To enable PNG rendering, install Firefox Nightly + ImageMagick:"
+    warn "    • Run menu option 'N' from this script (installs all deps), OR"
     warn "    • Manually install and set TRMNL_PREVIEW_FIREFOX=/path/to/firefox"
+    warn "    • Also ensure ImageMagick is installed: sudo apt install imagemagick"
     err "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     read -r -p "Continue anyway? [y/N] " cont
@@ -568,9 +653,10 @@ serve_daemon(){
     warn "  PNG export (/render/full.png) WILL FAIL with runtime errors."
     warn "  HTML preview (/render/full.html) will still work."
     warn ""
-    warn "  To enable PNG rendering, install Firefox Nightly:"
-    warn "    • Run menu option 'N' from this script, OR"
+    warn "  To enable PNG rendering, install Firefox Nightly + ImageMagick:"
+    warn "    • Run menu option 'N' from this script (installs all deps), OR"
     warn "    • Manually install and set TRMNL_PREVIEW_FIREFOX=/path/to/firefox"
+    warn "    • Also ensure ImageMagick is installed: sudo apt install imagemagick"
     err "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
   elif [[ ! -x "$FF_BIN" ]]; then
@@ -767,12 +853,19 @@ show_engine_info(){
 }
 
 # ------------ Firefox Nightly (APT-first, tar fallback) ------------
+# PNG rendering requires Firefox Nightly (stable Firefox lacks needed headless features).
+# Installation strategy:
+#   1. Try the Mozilla APT repository (cleanest, auto-updates)
+#   2. Fall back to downloading a tarball from Mozilla's CDN
+#   3. As a last resort, prompt the user for a local tarball path
+# Supports aarch64 (Pi 4/5), armv7l (Pi 3), and x86_64.
 arch_id(){ case "$(uname -m)" in aarch64) echo "linux-aarch64";; armv7l) echo "linux-arm";; armv6l) echo "linux-armv6";; x86_64) echo "linux64";; *) echo "unknown";; esac; }
 ffn_dep_install(){
   apt_install xz-utils bzip2 ca-certificates curl \
              libgtk-3-0 libdbus-1-3 libx11-xcb1 libxss1 libxcomposite1 \
              libxdamage1 libxfixes3 libnss3 libasound2 libxrandr2 libxtst6 \
              fonts-noto fonts-noto-color-emoji \
+             imagemagick \
              xvfb
 }
 download_ffn_tarball(){
@@ -800,6 +893,9 @@ tar_extract_auto(){
 }
 
 # ------------ Geckodriver (for selenium-webdriver PNG rendering) ------------
+# Geckodriver is the WebDriver implementation for Firefox, required by
+# selenium-webdriver to control Firefox for headless PNG screenshots.
+# Installed automatically alongside Firefox Nightly (menu option N).
 geckodriver_version(){
   geckodriver --version 2>/dev/null | head -1 | awk '{print $2}' || true
 }
@@ -1043,6 +1139,9 @@ change_settings_text(){
 }
 
 # ------------ Menu ------------
+# The main menu is the entry point for interactive use. It checks prerequisites
+# (Ruby 3.4+, dialog/whiptail) and then presents either a TUI menu (via whiptail/dialog)
+# or a plain text menu depending on terminal capabilities and user preference.
 main_menu(){
   ensure_base_dir
   ensure_ruby_34
@@ -1208,6 +1307,8 @@ main_menu_text(){
 }
 
 # ------------ Help flag ------------
+# Displayed when the user runs ./trmnlp-piserve.sh -h or --help.
+# Summarizes usage, menu keys, and environment variables.
 show_help(){
   cat <<'HELP'
 TRMNLP-PiServe - TRMNL plugin development manager for Raspberry Pi
@@ -1231,6 +1332,9 @@ Environment variables:
   ENABLE_PROXY=1|0      LAN proxy via socat (default: 1)
   PRINT_ONLY=1          Dry-run mode, print commands only
   TRMNLP_TUI=0          Force plain text menus (skip whiptail/dialog)
+
+PNG rendering dependencies (installed via menu option N):
+  Firefox Nightly, geckodriver, ImageMagick, xvfb
 
 Settings and secrets are stored in ~/.config/trmnlp-piserve/
 
