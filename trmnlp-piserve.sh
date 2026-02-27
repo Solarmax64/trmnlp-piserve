@@ -67,6 +67,9 @@ FF_PROFILE_DIR="${STATE_DIR}/ff-profile"
 ENGINE="${ENGINE:-gem}"             # gem|repo
 REPO_DIR="${REPO_DIR:-$HOME/trmnlp}"
 
+# TRMNL API base URL (used by "Fetch TRMNL context" to pull user/plugin data)
+TRMNL_API_BASE="${TRMNL_API_BASE:-https://usetrmnl.com/api}"
+
 SHOW_BACKUPS="${SHOW_BACKUPS:-0}"
 PRINT_ONLY="${PRINT_ONLY:-0}"
 
@@ -447,6 +450,7 @@ png_env_vars(){
 #   clone_plugin      — download an existing plugin from TRMNL by ID (menu 2)
 #   serve_foreground  — start the preview server in the current terminal (menu 3)
 #   push_plugin       — upload your plugin changes to TRMNL (menu 4)
+#   fetch_trmnl_context — fetch user/plugin data from TRMNL API into .trmnlp.yml (post-clone)
 init_plugin(){
   read -r -p "New plugin folder name: " name; name="$(trim "$name")"; [[ -n "$name" ]] || { warn "Canceled."; return; }
   local dest="${BASE_DIR}/${name}"; [[ -e "$dest" ]] && { warn "Exists: $dest"; return; }
@@ -494,6 +498,43 @@ clone_plugin(){
     (cd "${BASE_DIR}" && run trmnl plugin clone "$(basename "$dest")" "$pid")
   fi
   note "Cloned to ${dest}"
+
+  # Fetch TRMNL context into .trmnlp.yml (requires API key)
+  # Post-clone prompts use dialog when available (trmnlp clone may consume stdin,
+  # making plain read unreliable). Plain-text fallback reads from /dev/tty.
+  if grep -q '^TRMNL_API_KEY=' "${SECRETS_FILE}" 2>/dev/null; then
+    local do_fetch=1
+    if [[ -n "${DIALOG_CMD:-}" ]]; then
+      dialog_yesno "Fetch Context" "Fetch TRMNL context into .trmnlp.yml?" 8 50 || do_fetch=0
+    else
+      local fetch_ctx=""
+      read -r -p "Fetch TRMNL context into .trmnlp.yml? [Y/n] " fetch_ctx < /dev/tty || true
+      [[ "$fetch_ctx" =~ ^[Nn]$ ]] && do_fetch=0
+    fi
+    if [[ $do_fetch -eq 1 ]]; then
+      fetch_trmnl_context "$dest" "$pid"
+    fi
+  else
+    local do_save=1
+    if [[ -n "${DIALOG_CMD:-}" ]]; then
+      dialog_msgbox "No API Key" "No TRMNL API key saved.\n\nThe .trmnlp.yml context fetch requires an API key.\nYou can also save your key later via the main menu." 10 55
+      dialog_yesno "Save API Key" "Save your TRMNL API key now?" 8 45 || do_save=0
+    else
+      warn "No TRMNL API key saved. Skipping .trmnlp.yml context fetch."
+      warn "To save your API key, use the main menu or run option 'A' (Login)."
+      local save_key_now=""
+      read -r -p "Save your API key now? [Y/n] " save_key_now < /dev/tty || true
+      [[ "$save_key_now" =~ ^[Nn]$ ]] && do_save=0
+    fi
+    if [[ $do_save -eq 1 ]]; then
+      save_api_key
+      # Re-check and fetch if key was saved successfully
+      if grep -q '^TRMNL_API_KEY=' "${SECRETS_FILE}" 2>/dev/null; then
+        source "${SECRETS_FILE}"; export TRMNL_API_KEY
+        fetch_trmnl_context "$dest" "$pid"
+      fi
+    fi
+  fi
 }
 
 # ---- Nightly detection helpers ----
@@ -636,6 +677,129 @@ push_plugin(){
     run trmnl login
     (cd "${BASE_DIR}/${plugin}" && run trmnl plugin push)
   fi
+}
+
+# fetch_trmnl_context — fetch user profile & plugin settings from the TRMNL API
+# and write them into a plugin's .trmnlp.yml under the variables.trmnl section.
+# This populates the local preview with realistic user/device/plugin data.
+#
+# Usage: fetch_trmnl_context <plugin_dir> <plugin_setting_id>
+#   plugin_dir        — full path to the plugin directory (e.g., /home/pi/.../my-plugin)
+#   plugin_setting_id — numeric TRMNL plugin setting ID (same one used for clone)
+fetch_trmnl_context(){
+  local plugin_dir="$1"
+  local psid="$2"
+  [[ -d "$plugin_dir" ]] || { err "Plugin dir not found: ${plugin_dir}"; return; }
+  [[ -n "$psid" ]] || { err "No plugin_setting_id provided."; return; }
+
+  local yml_path="${plugin_dir}/.trmnlp.yml"
+
+  # API key should already be exported by the caller (clone_plugin), but verify
+  if [[ -z "${TRMNL_API_KEY:-}" ]]; then
+    warn "No TRMNL API key available. Skipping context fetch."
+    return
+  fi
+
+  # Fetch user profile
+  note "Fetching user profile from TRMNL API..."
+  local me_response=""
+  me_response="$(curl -sfS --retry 2 \
+    -H "Authorization: Bearer ${TRMNL_API_KEY}" \
+    -H "Accept: application/json" \
+    "${TRMNL_API_BASE}/me" 2>&1)" || {
+    err "Failed to fetch user profile. Check your API key."
+    return
+  }
+
+  # Fetch plugin settings and find the one matching our plugin_setting_id
+  note "Fetching plugin settings from TRMNL API..."
+  local ps_response=""
+  ps_response="$(curl -sfS --retry 2 \
+    -H "Authorization: Bearer ${TRMNL_API_KEY}" \
+    -H "Accept: application/json" \
+    "${TRMNL_API_BASE}/plugin_settings" 2>&1)" || {
+    err "Failed to fetch plugin settings. Check your API key."
+    return
+  }
+
+  # Extract the matching plugin setting by ID
+  local ps_json=""
+  ps_json="$(ruby -rjson -e '
+    raw = JSON.parse(ARGV[0]) rescue {}
+    settings = raw["data"] || raw
+    settings = [settings].flatten.compact
+    target_id = ARGV[1].to_i
+    match = settings.find { |s| s["id"].to_i == target_id }
+    if match
+      puts match.to_json
+    else
+      STDERR.puts "[!] No plugin setting found with id #{target_id}."
+      exit 1
+    end
+  ' "$ps_response" "$psid")" || {
+    warn "Could not find plugin setting #${psid} in your TRMNL account. Skipping context fetch."
+    return
+  }
+
+  # Backup existing .trmnlp.yml
+  if [[ -f "$yml_path" ]]; then
+    cp "$yml_path" "${yml_path}.bak-$(ts)"
+    note "Backed up existing .trmnlp.yml"
+  fi
+
+  # Construct trmnl context and write to .trmnlp.yml via Ruby
+  note "Writing TRMNL context to ${yml_path}..."
+  ruby -ryaml -rjson -e '
+    yml_path = ARGV[0]
+    me_raw = JSON.parse(ARGV[1]) rescue {}
+    me_data = me_raw["data"] || me_raw
+    ps_data = JSON.parse(ARGV[2]) rescue {}
+
+    trmnl = {
+      "user" => {
+        "name"           => me_data["name"],
+        "first_name"     => me_data["first_name"],
+        "last_name"      => me_data["last_name"],
+        "locale"         => me_data["locale"] || "en",
+        "time_zone"      => me_data["time_zone"] || "UTC",
+        "time_zone_iana" => me_data["time_zone_iana"] || "Etc/UTC",
+        "utc_offset"     => me_data["utc_offset"] || 0
+      }.compact,
+      "device" => {
+        "friendly_id"     => "ABC123",
+        "percent_charged" => 85.0,
+        "wifi_strength"   => 90,
+        "height"          => 480,
+        "width"           => 800
+      },
+      "system" => {
+        "timestamp_utc" => Time.now.utc.to_i
+      },
+      "plugin_settings" => {
+        "instance_name"        => ps_data["instance_name"] || ps_data["name"],
+        "strategy"             => ps_data["strategy"] || "polling",
+        "dark_mode"            => ps_data["dark_mode"] || "no",
+        "polling_headers"      => ps_data["polling_headers"] || "",
+        "polling_url"          => ps_data["polling_url"] || "",
+        "custom_fields_values" => ps_data["custom_fields_values"] || {}
+      }.compact
+    }
+
+    # Load existing .trmnlp.yml and merge — preserves watch, custom_fields, etc.
+    existing = File.exist?(yml_path) ? (YAML.safe_load(File.read(yml_path), permitted_classes: [Symbol]) || {}) : {}
+    existing["variables"] ||= {}
+    existing["variables"]["trmnl"] = trmnl
+
+    File.write(yml_path, YAML.dump(existing))
+
+    STDERR.puts "[*] User:   #{trmnl["user"]["name"] || "(not set)"}"
+    STDERR.puts "[*] Plugin: #{trmnl["plugin_settings"]["instance_name"] || "(not set)"}"
+  ' "$yml_path" "$me_response" "$ps_json" || {
+    err "Failed to write .trmnlp.yml"
+    return
+  }
+
+  note "TRMNL context written to ${yml_path}"
 }
 
 list_plugins(){ get_plugins || true; }
@@ -1013,7 +1177,7 @@ main_menu_dialog(){
       "──" "── Plugin Workflow ─────────────────" \
       "1" "Init new plugin" \
       "2" "Clone plugin" \
-      "3" "Serve plugin (foreground)" \
+      "3" "Serve plugin" \
       "4" "Push plugin" \
       "──" "── Plugins ────────────────────────" \
       "L" "List plugins" \

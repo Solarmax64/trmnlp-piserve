@@ -64,7 +64,7 @@ I develop on Windows and use [Syncthing](https://syncthing.net/) to sync the plu
 | Key | Action |
 |-----|--------|
 | 1 | Init new plugin |
-| 2 | Clone plugin from TRMNL (by plugin_setting_id) |
+| 2 | Clone plugin from TRMNL (by plugin_setting_id), with optional context fetch |
 | 3 | Serve plugin in foreground (Ctrl+C to stop) |
 | 4 | Push plugin to TRMNL |
 
@@ -99,6 +99,20 @@ I develop on Windows and use [Syncthing](https://syncthing.net/) to sync the plu
 | 0 | Exit |
 
 This tool manages the plugin lifecycle (init, clone, serve, push) but is not a code editor. To view or edit plugin source files, use your preferred editor or IDE directly on the plugin directory under your plugins root.
+
+## TRMNL context fetch (post-clone)
+
+After cloning a plugin, the script offers to fetch your TRMNL user profile and plugin settings from the API and write them into the plugin's `.trmnlp.yml` under the `variables.trmnl` section. This populates the local preview with realistic user, device, and plugin data so your templates render with real values instead of placeholders.
+
+The fetch requires a TRMNL API key. If no key is saved, the script will offer to save one on the spot. The API key is stored in `~/.config/trmnlp-piserve/secrets.env` (mode 600).
+
+Data written to `.trmnlp.yml` includes:
+
+- **User**: name, locale, time zone, UTC offset
+- **Device**: friendly ID, battery, Wi-Fi strength, screen dimensions
+- **Plugin settings**: instance name, strategy, dark mode, polling URL, custom field values
+
+If a `.trmnlp.yml` already exists, it is backed up before being updated. Existing keys outside of `variables.trmnl` (such as `watch` or `custom_fields`) are preserved.
 
 ## Screenshots
 
