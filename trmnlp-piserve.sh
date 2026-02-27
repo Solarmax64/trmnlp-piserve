@@ -777,11 +777,6 @@ fetch_trmnl_context(){
       },
       "plugin_settings" => {
         "instance_name"        => ps_data["instance_name"] || ps_data["name"],
-        "strategy"             => ps_data["strategy"] || "polling",
-        "dark_mode"            => ps_data["dark_mode"] || "no",
-        "polling_headers"      => ps_data["polling_headers"] || "",
-        "polling_url"          => ps_data["polling_url"] || "",
-        "custom_fields_values" => ps_data["custom_fields_values"] || {}
       }.compact
     }
 
